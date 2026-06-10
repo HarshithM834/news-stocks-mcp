@@ -42,13 +42,17 @@ from urllib.parse import quote_plus
 # pyrefly: ignore [missing-import]
 import feedparser
 import httpx
+import asyncio
 # pyrefly: ignore [missing-import]
-from fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP
 # pyrefly: ignore [missing-import]
-from fastmcp.exceptions import ToolError
+from mcp.server.fastmcp.exceptions import ToolError
 # pyrefly: ignore [missing-import]
-from fastmcp.prompts import Message
+from mcp.types import PromptMessage, TextContent
 from pydantic import BaseModel, Field
+
+def Message(text: str, role: str) -> PromptMessage:
+    return PromptMessage(role=role, content=TextContent(type="text", text=text))
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION (all from environment variables, safe defaults provided)
@@ -146,7 +150,7 @@ mcp = FastMCP(
 # HELPERS – HTTP fetching & RSS normalisation
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_TICKER_RE = re.compile(r"^[A-Z0-9]{1,10}$")
+_TICKER_RE = re.compile(r"^[A-Z0-9\.\-]{1,10}$")
 
 
 def _clamp_limit(limit: int) -> int:
@@ -203,7 +207,7 @@ async def _fetch_feed(url: str, context_label: str) -> feedparser.FeedParserDict
         logger.error(msg)
         raise ToolError(msg)
 
-    feed = feedparser.parse(response.text)
+    feed = await asyncio.to_thread(feedparser.parse, response.text)
     if feed.bozo and not feed.entries:
         msg = (
             f"RSS/Atom parsing failed for {context_label}.  "
@@ -235,7 +239,7 @@ def _normalise_entries(
 
         articles.append(
             Article(
-                title=entry.get("title", "(no title)"),
+                title=entry.get("title") or "(no title)",
                 summary=entry.get("summary") or entry.get("description"),
                 link=entry.get("link", ""),
                 published=entry.get("published") or entry.get("updated"),
@@ -462,23 +466,31 @@ async def get_market_snapshot(
     )
 
     results: dict[str, Any] = {}
+    valid_symbols = []
 
     for raw_symbol in symbols:
         try:
             sym = _validate_symbol(raw_symbol)
+            valid_symbols.append((raw_symbol, sym))
         except ToolError as exc:
             results[raw_symbol.strip().upper() or raw_symbol] = {
                 "error": str(exc)
             }
-            continue
 
+    async def fetch_for_symbol(raw_symbol: str, sym: str) -> tuple[str, Any]:
         try:
             url = STOCK_NEWS_URL.format(symbol=quote_plus(sym))
             feed = await _fetch_feed(url, f"stock news for {sym}")
-            results[sym] = _normalise_entries(feed, limit_per_symbol)
-        except ToolError as exc:
+            return sym, _normalise_entries(feed, limit_per_symbol)
+        except Exception as exc:
             logger.warning("get_market_snapshot: failed for %s: %s", sym, exc)
-            results[sym] = {"error": str(exc)}
+            return sym, {"error": str(exc)}
+
+    tasks = [fetch_for_symbol(rs, s) for rs, s in valid_symbols]
+    fetched_results = await asyncio.gather(*tasks)
+    
+    for sym, res in fetched_results:
+        results[sym] = res
 
     logger.info(
         "get_market_snapshot completed for %d symbols (%d succeeded)",
@@ -591,7 +603,7 @@ def read_daily_news_snapshot() -> str:
 def portfolio_news_recommendations(
     portfolio_json: str,
     news_json: str,
-) -> list[Message]:
+) -> list[PromptMessage]:
     """Build the portfolio-news-recommendations prompt.
 
     Args:
@@ -713,7 +725,7 @@ def portfolio_news_recommendations(
 def daily_briefing(
     snapshot_json: str,
     output_format: str = "markdown",
-) -> list[Message]:
+) -> list[PromptMessage]:
     """Build the daily-briefing prompt.
 
     Args:
