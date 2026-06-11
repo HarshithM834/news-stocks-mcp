@@ -44,6 +44,12 @@ import feedparser
 import httpx
 import asyncio
 # pyrefly: ignore [missing-import]
+import pandas as pd
+# pyrefly: ignore [missing-import]
+import pandas_ta as ta
+# pyrefly: ignore [missing-import]
+import yfinance as yf
+# pyrefly: ignore [missing-import]
 from mcp.server.fastmcp import FastMCP
 # pyrefly: ignore [missing-import]
 from mcp.server.fastmcp.exceptions import ToolError
@@ -129,6 +135,14 @@ mcp = FastMCP(
           • get_global_news   – search global news by keyword.
           • get_stock_news    – search stock/finance news by ticker symbol.
           • get_market_snapshot – batch-fetch news for multiple tickers at once.
+          • get_stock_quote     – get live market data for a ticker.
+          • get_historical_prices – fetch OHLCV historical price action.
+          • get_company_profile   – get basic company fundamentals and profile.
+          • get_recent_sec_filings – fetch recent SEC filings for a ticker.
+          • get_options_chain     – fetch calls, puts, and implied volatility.
+          • get_technical_indicators – calculate MACD, RSI, and Bollinger Bands.
+          • get_asset_correlation – calculate Pearson correlation matrix for pairs trading.
+          • get_macro_risk_metrics – fetch VIX and 10-year Treasury yields.
 
         RESOURCES
           • data://portfolio            – the user's saved portfolio (tickers, weights, risk prefs).
@@ -498,6 +512,365 @@ async def get_market_snapshot(
         sum(1 for v in results.values() if isinstance(v, list)),
     )
     return results
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": True,
+        "openWorldHint": True,
+        "idempotentHint": True,
+    },
+)
+async def get_stock_quote(symbol: str) -> dict[str, Any]:
+    """Fetch live/latest market quote for a ticker symbol using yfinance.
+
+    Args:
+        symbol: The stock ticker symbol (e.g. AAPL).
+
+    Returns:
+        JSON object containing the last price, volume, previous close,
+        day high, and day low.
+    """
+    symbol = _validate_symbol(symbol)
+    logger.info("TOOL get_stock_quote symbol=%s", symbol)
+    try:
+        ticker = yf.Ticker(symbol)
+        info = await asyncio.to_thread(lambda: ticker.fast_info)
+        return {
+            "symbol": symbol,
+            "last_price": info.last_price,
+            "previous_close": info.previous_close,
+            "open": info.open,
+            "day_high": info.day_high,
+            "day_low": info.day_low,
+            "volume": info.last_volume,
+        }
+    except Exception as exc:
+        msg = f"Failed to fetch stock quote for {symbol}: {exc}"
+        logger.error(msg)
+        raise ToolError(msg)
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": True,
+        "openWorldHint": True,
+        "idempotentHint": True,
+    },
+)
+async def get_historical_prices(symbol: str, period: str = "1mo", interval: str = "1d") -> list[dict[str, Any]]:
+    """Fetch historical price action for a ticker symbol using yfinance.
+
+    Args:
+        symbol: The stock ticker symbol (e.g. AAPL).
+        period: Time period to fetch (e.g., '1d', '5d', '1mo', '3mo', '6mo', '1y', '5y', 'max').
+        interval: Data interval (e.g., '1d', '1wk', '1mo').
+
+    Returns:
+        List of JSON objects representing OHLCV data.
+    """
+    symbol = _validate_symbol(symbol)
+    logger.info("TOOL get_historical_prices symbol=%s period=%s interval=%s", symbol, period, interval)
+    try:
+        ticker = yf.Ticker(symbol)
+        hist = await asyncio.to_thread(ticker.history, period=period, interval=interval)
+        if hist.empty:
+            raise ToolError(f"No historical data found for {symbol}")
+        
+        # Format the dataframe into a list of dicts with string dates
+        hist.reset_index(inplace=True)
+        # convert datetime to string
+        if "Date" in hist.columns:
+            hist["Date"] = hist["Date"].astype(str)
+        elif "Datetime" in hist.columns:
+            hist["Datetime"] = hist["Datetime"].astype(str)
+            
+        return hist.to_dict(orient="records")
+    except Exception as exc:
+        msg = f"Failed to fetch historical prices for {symbol}: {exc}"
+        logger.error(msg)
+        raise ToolError(msg)
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": True,
+        "openWorldHint": True,
+        "idempotentHint": True,
+    },
+)
+async def get_company_profile(symbol: str) -> dict[str, Any]:
+    """Fetch basic fundamental and profile information for a company using yfinance.
+
+    Args:
+        symbol: The stock ticker symbol (e.g. AAPL).
+
+    Returns:
+        JSON object containing sector, industry, description, market cap, P/E, etc.
+    """
+    symbol = _validate_symbol(symbol)
+    logger.info("TOOL get_company_profile symbol=%s", symbol)
+    try:
+        ticker = yf.Ticker(symbol)
+        info = await asyncio.to_thread(lambda: ticker.info)
+        return {
+            "symbol": symbol,
+            "shortName": info.get("shortName"),
+            "sector": info.get("sector"),
+            "industry": info.get("industry"),
+            "longBusinessSummary": info.get("longBusinessSummary"),
+            "marketCap": info.get("marketCap"),
+            "trailingPE": info.get("trailingPE"),
+            "forwardPE": info.get("forwardPE"),
+            "dividendYield": info.get("dividendYield"),
+            "targetMeanPrice": info.get("targetMeanPrice"),
+            "recommendationKey": info.get("recommendationKey"),
+        }
+    except Exception as exc:
+        msg = f"Failed to fetch company profile for {symbol}: {exc}"
+        logger.error(msg)
+        raise ToolError(msg)
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": True,
+        "openWorldHint": True,
+        "idempotentHint": True,
+    },
+)
+async def get_recent_sec_filings(symbol: str, limit: int = 10) -> list[dict[str, Any]]:
+    """Fetch recent SEC filings for a ticker symbol using the official SEC EDGAR RSS feed.
+
+    Args:
+        symbol: The stock ticker symbol (e.g. AAPL).
+        limit: Maximum number of filings to return. Defaults to 10.
+
+    Returns:
+        List of JSON objects representing recent filings.
+    """
+    symbol = _validate_symbol(symbol)
+    limit = _clamp_limit(limit)
+    logger.info("TOOL get_recent_sec_filings symbol=%s limit=%d", symbol, limit)
+
+    url = f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={quote_plus(symbol)}&type=&dateb=&owner=exclude&start=0&count={limit}&output=atom"
+    try:
+        # We need a proper User-Agent for SEC
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers={"User-Agent": "PersonalHedgeFundAgent/1.0 (admin@example.com)"}) as client:
+            response = await client.get(url, follow_redirects=True)
+            response.raise_for_status()
+            
+        feed = await asyncio.to_thread(feedparser.parse, response.text)
+        if feed.bozo and not feed.entries:
+            raise ToolError(f"RSS parsing failed for SEC filings of {symbol}.")
+            
+        filings = []
+        for entry in feed.entries[:limit]:
+            filings.append({
+                "title": entry.get("title", ""),
+                "summary": entry.get("summary", ""),
+                "link": entry.get("link", ""),
+                "published": entry.get("updated", ""),
+            })
+        return filings
+    except Exception as exc:
+        msg = f"Failed to fetch SEC filings for {symbol}: {exc}"
+        logger.error(msg)
+        raise ToolError(msg)
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": True,
+        "openWorldHint": True,
+        "idempotentHint": True,
+    },
+)
+async def get_options_chain(symbol: str, expiration_date: str = None) -> dict[str, Any]:
+    """Fetch options chain data (calls and puts) for a ticker.
+    
+    Args:
+        symbol: The stock ticker symbol.
+        expiration_date: Optional. The expiration date (YYYY-MM-DD). If omitted, returns the nearest expiration.
+        
+    Returns:
+        JSON object with lists of calls and puts including strike, lastPrice, volume, openInterest, and impliedVolatility.
+    """
+    symbol = _validate_symbol(symbol)
+    logger.info("TOOL get_options_chain symbol=%s expiration_date=%s", symbol, expiration_date)
+    try:
+        ticker = yf.Ticker(symbol)
+        options = await asyncio.to_thread(lambda: ticker.options)
+        if not options:
+            raise ToolError(f"No options available for {symbol}")
+            
+        if expiration_date and expiration_date not in options:
+            raise ToolError(f"Expiration date {expiration_date} not valid. Valid dates are: {options[:5]}...")
+            
+        target_date = expiration_date if expiration_date else options[0]
+        chain = await asyncio.to_thread(ticker.option_chain, target_date)
+        
+        # Convert dataframes to dicts
+        calls = chain.calls[['strike', 'lastPrice', 'volume', 'openInterest', 'impliedVolatility']].fillna(0).to_dict(orient="records")
+        puts = chain.puts[['strike', 'lastPrice', 'volume', 'openInterest', 'impliedVolatility']].fillna(0).to_dict(orient="records")
+        
+        return {
+            "symbol": symbol,
+            "expiration_date": target_date,
+            "calls": calls,
+            "puts": puts
+        }
+    except Exception as exc:
+        msg = f"Failed to fetch options chain for {symbol}: {exc}"
+        logger.error(msg)
+        raise ToolError(msg)
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": True,
+        "openWorldHint": True,
+        "idempotentHint": True,
+    },
+)
+async def get_technical_indicators(symbol: str, period: str = "6mo") -> dict[str, Any]:
+    """Fetch key technical indicators (MACD, RSI, Bollinger Bands) for a ticker using pandas-ta.
+    
+    Args:
+        symbol: The stock ticker symbol.
+        period: Time period of historical data to use for calculation (default '6mo').
+        
+    Returns:
+        JSON object with the latest values for RSI, MACD, and Bollinger Bands.
+    """
+    symbol = _validate_symbol(symbol)
+    logger.info("TOOL get_technical_indicators symbol=%s period=%s", symbol, period)
+    try:
+        ticker = yf.Ticker(symbol)
+        df = await asyncio.to_thread(ticker.history, period=period)
+        if df.empty:
+            raise ToolError(f"No historical data found for {symbol} to calculate indicators.")
+            
+        # Calculate indicators using pandas-ta
+        df.ta.macd(append=True)
+        df.ta.rsi(append=True)
+        df.ta.bbands(append=True)
+        
+        latest = df.iloc[-1]
+        
+        # Extract the latest values safely (handling NaN)
+        def _get_val(col_prefix):
+            for col in latest.index:
+                if col.startswith(col_prefix):
+                    val = latest[col]
+                    return float(val) if pd.notna(val) else None
+            return None
+
+        return {
+            "symbol": symbol,
+            "date": str(latest.name),
+            "close": float(latest['Close']),
+            "rsi": _get_val("RSI"),
+            "macd": _get_val("MACD_"),
+            "macd_histogram": _get_val("MACDh_"),
+            "macd_signal": _get_val("MACDs_"),
+            "bollinger_lower": _get_val("BBL_"),
+            "bollinger_mid": _get_val("BBM_"),
+            "bollinger_upper": _get_val("BBU_")
+        }
+    except Exception as exc:
+        msg = f"Failed to calculate technical indicators for {symbol}: {exc}"
+        logger.error(msg)
+        raise ToolError(msg)
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": True,
+        "openWorldHint": True,
+        "idempotentHint": True,
+    },
+)
+async def get_asset_correlation(symbols: list[str], period: str = "1y") -> dict[str, Any]:
+    """Calculate the Pearson correlation matrix for a list of ticker symbols.
+    
+    Useful for statistical arbitrage and finding pairs to trade.
+    
+    Args:
+        symbols: List of stock ticker symbols.
+        period: Time period of historical data (default '1y').
+        
+    Returns:
+        JSON object representing the correlation matrix.
+    """
+    if len(symbols) < 2:
+        raise ToolError("Must provide at least 2 symbols to calculate correlation.")
+        
+    valid_symbols = [_validate_symbol(s) for s in symbols]
+    logger.info("TOOL get_asset_correlation symbols=%s period=%s", valid_symbols, period)
+    
+    try:
+        # Download historical adjusted close prices
+        data = await asyncio.to_thread(yf.download, valid_symbols, period=period, progress=False)
+        
+        # 'data' has a MultiIndex column structure if multiple tickers are returned
+        # Depending on yfinance version, 'Close' or 'Adj Close'
+        if "Adj Close" in data:
+            prices = data["Adj Close"]
+        elif "Close" in data:
+            prices = data["Close"]
+        else:
+            raise ToolError("Could not find closing price data in yfinance response.")
+            
+        if isinstance(prices, pd.Series):
+            # Only one symbol successfully downloaded
+            raise ToolError("Could not calculate correlation (insufficient data).")
+            
+        # Calculate daily log returns
+        import numpy as np
+        returns = np.log(prices / prices.shift(1)).dropna()
+        
+        corr_matrix = returns.corr().round(4)
+        
+        # Convert DataFrame to a nested dictionary
+        result = {}
+        for col in corr_matrix.columns:
+            result[str(col)] = {str(idx): float(val) for idx, val in corr_matrix[col].items()}
+            
+        return result
+    except Exception as exc:
+        msg = f"Failed to calculate correlation matrix: {exc}"
+        logger.error(msg)
+        raise ToolError(msg)
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": True,
+        "openWorldHint": True,
+        "idempotentHint": True,
+    },
+)
+async def get_macro_risk_metrics() -> dict[str, Any]:
+    """Fetch macro-economic risk indicators (VIX and 10-Year Treasury Yield).
+    
+    Returns:
+        JSON object with the latest values for ^VIX and ^TNX.
+    """
+    logger.info("TOOL get_macro_risk_metrics")
+    try:
+        tickers = yf.Tickers("^VIX ^TNX")
+        vix_info = await asyncio.to_thread(lambda: tickers.tickers["^VIX"].fast_info)
+        tnx_info = await asyncio.to_thread(lambda: tickers.tickers["^TNX"].fast_info)
+        
+        return {
+            "VIX_volatility_index": vix_info.last_price,
+            "US_10Y_Treasury_Yield": tnx_info.last_price
+        }
+    except Exception as exc:
+        msg = f"Failed to fetch macro risk metrics: {exc}"
+        logger.error(msg)
+        raise ToolError(msg)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

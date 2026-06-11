@@ -12,6 +12,8 @@ from news_mcp_server import (
     read_portfolio,
     daily_briefing
 )
+# pyrefly: ignore [missing-import]
+# type: ignore
 from mcp.server.fastmcp.exceptions import ToolError
 
 async def run_diagnostics():
